@@ -1,0 +1,3 @@
+requests
+langchain_community
+langchain_ollama
