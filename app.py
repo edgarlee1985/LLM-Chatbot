@@ -12,7 +12,6 @@ from langchain_community.retrievers import BM25Retriever
 from langchain_classic.retrievers import EnsembleRetriever
 
 from langchain_community.chat_models import ChatOllama
-from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.runnables import RunnablePassthrough, RunnableParallel, RunnableLambda
 from langchain_core.output_parsers import StrOutputParser
 
@@ -214,6 +213,33 @@ def create_rag_chain(llm, retriever):
 
     return final_rag_chain
 
+def summit_feed_score(current_trace_id: str):
+    # Langfuse 評分回饋機制
+    if current_trace_id:
+        while True:
+            feedback = input("回饋 [good/bad/skip]: ").strip().lower()
+            if feedback == 'skip':
+                break
+                    
+            score_value = None
+            if feedback.lower() == 'good':
+                score_value = 1
+            elif feedback.lower() == 'bad':
+                score_value = 0
+                
+            if score_value is not None:
+                # 創建 Langfuse Score
+                langfuse.create_score(
+                    name = "user_feedback",
+                    value = score_value,
+                    trace_id = current_trace_id,
+                    comment = f"用戶對此次回答的回饋: {feedback}",
+                    )
+                print(f"回饋 ({feedback}) 已發送到 Langfuse (Trace ID: {current_trace_id})")
+                break
+            else:
+                print("無效輸入。請輸入 'good', 'bad', 或 'skip'。")
+
 def main():
 
     # 建立 LLM
@@ -286,6 +312,11 @@ def main():
             execution_time = end_time - start_time
             print(f"程式執行時間: {execution_time:.4f} 秒")
 
+            current_trace_id = None
+            if langfuse_callback:
+                current_trace_id = langfuse_callback.last_trace_id
+
+            summit_feed_score(current_trace_id)
 
         except Exception as e:
             print(f"error: {e}")
