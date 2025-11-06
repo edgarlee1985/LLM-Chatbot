@@ -2,6 +2,8 @@ requests
 pypdf
 langchain_community
 langchain_ollama
+langchain
+langfuse
 faiss-cpu
 rank-bm25
 sentence-transformers

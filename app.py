@@ -2,6 +2,8 @@ import os
 import time
 from typing import Optional, Any
 from pathlib import Path
+from operator import itemgetter
+
 from langchain_community.document_loaders import DirectoryLoader, PyPDFLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_community.embeddings import HuggingFaceEmbeddings
@@ -10,8 +12,11 @@ from langchain_community.retrievers import BM25Retriever
 from langchain_classic.retrievers import EnsembleRetriever
 from langchain_community.chat_models import ChatOllama
 from langchain_core.prompts import ChatPromptTemplate
-from langchain_core.runnables import RunnablePassthrough, RunnableParallel
+from langchain_core.runnables import RunnablePassthrough, RunnableParallel, RunnableLambda
 from langchain_core.output_parsers import StrOutputParser
+
+from langfuse import Langfuse, get_client
+from langfuse.langchain import CallbackHandler
 
 DATA_PATH = "./data"
 LLM_MODEL_NAME = "qwen3"
@@ -20,6 +25,17 @@ LLM_MODEL_NAME = "qwen3"
 EMBED_MODEL_NAME = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
 
 VECTOR_DB_PATH = "FAISS_DB"
+
+
+Langfuse(host = "http://localhost:3000",
+        secret_key = "YOUR_KEY",
+        public_key = "YOUR_KEY"
+        )
+
+langfuse = get_client()
+print("langfuse.auth_check = " + str(langfuse.auth_check()))
+
+langfuse_callback = CallbackHandler()
 
 def get_vectorstore_retriever() -> Optional[Any]:
     """
@@ -119,8 +135,8 @@ def create_rag_chain(retriever):
     prompt = ChatPromptTemplate.from_template(template)
 
     retrieval_module = RunnableParallel(
-        docs = retriever, 
-        question = RunnablePassthrough() 
+        docs = RunnableLambda(lambda x: x['question']) | retriever, 
+        question = lambda x: x['question']
     )
 
     def format_docs(docs):
@@ -129,8 +145,8 @@ def create_rag_chain(retriever):
     # step 1. index, 2. prompt, 3. llm, 4. output
     generation_module = (
         RunnableParallel(
-            context=lambda x: format_docs(x['docs']),
-            question=lambda x: x['question']
+            context = lambda x: format_docs(x['docs']),
+            question = lambda x: x['question']
         )
         | prompt
         | llm
@@ -138,9 +154,9 @@ def create_rag_chain(retriever):
     )
 
     final_rag_chain = retrieval_module.assign(
-        answer=generation_module
+        answer = generation_module
     ).assign(
-        source_documents=lambda x: x['docs']
+        source_documents = lambda x: x['docs']
     ).pick(["answer", "source_documents"])
 
     return final_rag_chain
@@ -161,16 +177,19 @@ def main():
     print("\n --- 聊天機器人已就緒(輸入 'exit' 或 'quit 退出')")
 
     while True:
-        query = input("you: ")
-        if query.lower() in ["exit", "quit"]:
+        user_input = input("you: ")
+        if user_input.lower() in ["exit", "quit"]:
             break
-        if not query.strip():
+        if not user_input.strip():
             continue
 
         start_time = time.perf_counter()
         print("機器人思考中...")
         try:
-            result = rag_chain.invoke(query)
+            config = {"callbacks": [langfuse_callback]}
+            result = rag_chain.invoke(
+                {"question": user_input},
+                config = config)
             print("\nAnswer:\n" + result['answer'])
 
             source_docs = result['source_documents']
