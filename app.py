@@ -10,10 +10,16 @@ from langchain_community.embeddings import HuggingFaceEmbeddings
 from langchain_community.vectorstores import FAISS
 from langchain_community.retrievers import BM25Retriever
 from langchain_classic.retrievers import EnsembleRetriever
+
 from langchain_community.chat_models import ChatOllama
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.runnables import RunnablePassthrough, RunnableParallel, RunnableLambda
 from langchain_core.output_parsers import StrOutputParser
+
+from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
+from langchain_core.runnables.history import RunnableWithMessageHistory
+from langchain_core.chat_history import BaseChatMessageHistory
+from langchain_community.chat_message_histories import ChatMessageHistory
 
 from langfuse import Langfuse, get_client
 from langfuse.langchain import CallbackHandler
@@ -26,6 +32,8 @@ EMBED_MODEL_NAME = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
 
 VECTOR_DB_PATH = "FAISS_DB"
 
+# 聊天記錄儲存 (簡易的記憶體內儲存)
+store = {}
 
 Langfuse(host = "http://localhost:3000",
         secret_key = "YOUR_KEY",
@@ -118,64 +126,125 @@ def get_vectorstore_retriever() -> Optional[Any]:
     print("RAG 混合檢索器已準備就緒。")
     return ensemble_retriever
 
-def create_rag_chain(retriever):
-    llm = ChatOllama(model = LLM_MODEL_NAME)
-    print(f"初始化成功, Model = {LLM_MODEL_NAME}")
-
-    template = """
-    你是一個問答助手. 請使用提供的**上下文**信息來回答問題.
-    如果上下文中沒有足夠的信息來回答, 請說明你不知道, 不要編造答案.
-    請以簡潔, 專業的中文進行回答.
-    上下文:
-    {context}
-
-    問題:
-    {question}
+# --- 歷史對話管理 ---
+HISTORY_LENGTH = -1
+def get_session_history(session_id: str) -> BaseChatMessageHistory:
     """
-    prompt = ChatPromptTemplate.from_template(template)
+    根據 session_id 取得或建立一個聊天記錄。
+    """
+    if session_id not in store:
+        store[session_id] = ChatMessageHistory()
 
-    retrieval_module = RunnableParallel(
-        docs = RunnableLambda(lambda x: x['question']) | retriever, 
-        question = lambda x: x['question']
+    history: ChatMessageHistory = store[session_id]
+    if HISTORY_LENGTH != -1 and len(history.messages) > HISTORY_LENGTH:
+        history.messages = history.messages[ -HISTORY_LENGTH: ]
+
+    return history
+
+def format_docs(docs):
+    return "\n\n".join(doc.page_content for doc in docs)
+    
+def create_rag_chain(llm, retriever):
+    
+    """
+    建立核心的 RAG 鏈。
+    這個鏈會被 RunnableWithMessageHistory 包裝。
+    
+    輸入: {"question": str, "history": List[BaseMessage]}
+    輸出: {"answer": str, "sources": List[Document]}
+    """
+
+    # 檢索鏈 (Retrieval Chain)
+    # 這個鏈會接收 {"question": ..., "history": ...}
+    # 並輸出 {"sources": [Docs], "question": ..., "history": ...}
+    # 使用 itemgetter("question") 來指定只用問題來檢索
+    retrieval_docs_chain = RunnableParallel(
+        sources = itemgetter("question") | retriever,
+        question = itemgetter("question"),
+        history = itemgetter("history")
     )
+    #print("retrieval_docs_chain = " + str(retrieval_docs_chain) + "\n")
 
-    def format_docs(docs):
-        return "\n\n".join(doc.page_content for doc in docs)
-
-    # step 1. index, 2. prompt, 3. llm, 4. output
-    generation_module = (
-        RunnableParallel(
-            context = lambda x: format_docs(x['docs']),
-            question = lambda x: x['question']
-        )
-        | prompt
-        | llm
-        | StrOutputParser()
+    # 內容格式化鏈 (Context Formatting Chain)
+    # 接收上一步的輸出
+    # 輸出 {"context": str, "question": ..., "history": ..., "sources": [Docs]}
+    format_docs_chain = RunnableParallel(
+        context = lambda x : format_docs(x["sources"]),
+        question = itemgetter("question"),
+        history = itemgetter("history"),
+        sources = itemgetter("sources") # 將 sources 透傳下去
     )
+    #print("format_docs_chain = " + str(format_docs_chain) + "\n")
 
-    final_rag_chain = retrieval_module.assign(
-        answer = generation_module
-    ).assign(
-        source_documents = lambda x: x['docs']
-    ).pick(["answer", "source_documents"])
+    # 提示 (Prompt) + LLM 鏈
+
+    # 定義提示模板
+    system_prompt = (
+        "你是一個專業的問答助理。"
+        "請使用以下提供的'上下文'和'對話紀錄'來回答問題。"
+        "如果上下文中沒有相關資訊，請明確告知你不知道，不要編造答案。"
+        "請保持答案簡潔。\n\n"
+        "上下文:\n{context}"
+    )
+    
+    prompt = ChatPromptTemplate.from_messages([
+        ("system", system_prompt),
+        MessagesPlaceholder(variable_name = "history"),
+        ("human", "{question}"),
+    ])
+    #print("prompt = " + str(prompt) + "\n")
+    
+    # RAG 核心鏈
+    # 接收 {"context": str, "question": ..., "history": ...}
+    # 輸出 AI 的回答 (字串)
+    base_llm_chain = prompt | llm | StrOutputParser()
+
+    # 組合最終鏈 (用於 RunnableWithMessageHistory)
+    # 接收 {"context": ..., "question": ..., "history": ..., "sources": ...}
+    # 輸出 {"answer": str, "sources": [Docs]}
+    # 使用 RunnableParallel 來同時執行 LLM (獲取答案) 並透傳 sources
+    chat_output_chain = RunnableParallel(
+        answer = base_llm_chain,
+        sources = itemgetter("sources")
+    )
+    #print("chat_output_chain = " + str(chat_output_chain) + "\n")
+
+    # (檢索) -> (格式化) -> (LLM + 透傳)
+    final_rag_chain = retrieval_docs_chain | format_docs_chain | chat_output_chain
 
     return final_rag_chain
 
 def main():
+
+    # 建立 LLM
     try:
-        ChatOllama(model = LLM_MODEL_NAME).invoke("test")
-        print("Ollama 服務連接成功")
+        llm = ChatOllama(model=LLM_MODEL_NAME)
+        print(f"初始化成功, Model = {LLM_MODEL_NAME}")
     except Exception as e:
-        print(f"error: 無法連接 Ollama 服務或找不到模型 {LLM_MODEL_NAME}. 請確定 Ollama 正在運行並已拉取 'ollama pull {LLM_MODEL_NAME}'")
-        print(e)
+        print(f"錯誤：無法初始化 Ollama LLM ({LLM_MODEL_NAME})。")
+        print(f"請確保 Ollama 正在運行且已拉取 (pull) '{LLM_MODEL_NAME}' 模型。")
+        print(f"錯誤訊息：{e}")
         return
 
     retriever = get_vectorstore_retriever()
 
-    rag_chain = create_rag_chain(retriever)
+    # 建立 RAG 鏈
+    rag_chain = create_rag_chain(llm, retriever)
+
+    # 使用 RunnableWithMessageHistory 包裝 RAG 鏈
+    # 這會自動處理歷史記錄的載入和儲存
+    chain_with_history = RunnableWithMessageHistory(
+        rag_chain,
+        get_session_history,
+        input_messages_key = "question",     # 傳遞給 rag_chain 的使用者輸入 key
+        history_messages_key = "history",   # 傳遞給 rag_chain 的歷史記錄 key
+        output_messages_key = "answer",     # 從 rag_chain 的輸出中，要儲存為 AI 回應的 key
+    )
 
     print("\n --- 聊天機器人已就緒(輸入 'exit' 或 'quit 退出')")
 
+    # 聊天循環
+    session_id = "default_user_session"
     while True:
         user_input = input("you: ")
         if user_input.lower() in ["exit", "quit"]:
@@ -187,12 +256,18 @@ def main():
         print("機器人思考中...")
         try:
             config = {"callbacks": [langfuse_callback]}
-            result = rag_chain.invoke(
+            # 4.5. 呼叫 (invoke) 鏈
+            # 需要傳遞 'question' (符合 input_messages_key)
+            # 需要在 config 中傳遞 'session_id'
+            config = {"configurable": {"session_id": session_id}, "callbacks": [langfuse_callback]}
+
+            # 執行鏈
+            result = chain_with_history.invoke(
                 {"question": user_input},
                 config = config)
             print("\nAnswer:\n" + result['answer'])
 
-            source_docs = result['source_documents']
+            source_docs = result['sources']
             # 顯示來源
             if source_docs:
                 print("\n--- 檢索來源 ---")
