@@ -213,6 +213,21 @@ def create_rag_chain(llm, retriever):
 
     return final_rag_chain
 
+def print_retrieval_docs(result):
+    source_docs = result['sources']
+    # 顯示來源
+    if source_docs:
+        print("\n--- 檢索來源 ---")
+        seen_sources = set()
+        for doc in source_docs:
+            source_file = doc.metadata.get('source', '未知檔案')
+            page = doc.metadata.get('page', 'N/A')
+            source_key = f"{os.path.basename(source_file)} (頁碼: {page + 1})"
+            
+            if source_key not in seen_sources:
+                print(f"  - {source_key}")
+                seen_sources.add(source_key)
+
 def summit_feed_score(current_trace_id: str):
     # Langfuse 評分回饋機制
     if current_trace_id:
@@ -293,19 +308,7 @@ def main():
                 config = config)
             print("\nAnswer:\n" + result['answer'])
 
-            source_docs = result['sources']
-            # 顯示來源
-            if source_docs:
-                print("\n--- 檢索來源 ---")
-                seen_sources = set()
-                for doc in source_docs:
-                    source_file = doc.metadata.get('source', '未知檔案')
-                    page = doc.metadata.get('page', 'N/A')
-                    source_key = f"{os.path.basename(source_file)} (頁碼: {page + 1})"
-                    
-                    if source_key not in seen_sources:
-                        print(f"  - {source_key}")
-                        seen_sources.add(source_key)
+            print_retrieval_docs(result)
 
             print("-" * 60)
             end_time = time.perf_counter()
