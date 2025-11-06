@@ -1,10 +1,13 @@
 import os
 import time
 from typing import Optional, Any
+from pathlib import Path
 from langchain_community.document_loaders import DirectoryLoader, PyPDFLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_community.embeddings import HuggingFaceEmbeddings
 from langchain_community.vectorstores import FAISS
+from langchain_community.retrievers import BM25Retriever
+from langchain_classic.retrievers import EnsembleRetriever
 from langchain_community.chat_models import ChatOllama
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.runnables import RunnablePassthrough, RunnableParallel
@@ -19,61 +22,85 @@ EMBED_MODEL_NAME = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
 VECTOR_DB_PATH = "FAISS_DB"
 
 def get_vectorstore_retriever() -> Optional[Any]:
-    print(f"初始化 HuggingFace 嵌入模型: {EMBED_MODEL_NAME}...")
-    model_kwargs = {'device': 'cpu'} 
-    encode_kwargs = {'normalize_embeddings': True}
-    embeddings = HuggingFaceEmbeddings(
-        model_name = EMBED_MODEL_NAME,
-        model_kwargs = model_kwargs,
-        encode_kwargs = encode_kwargs
+    """
+    載入 PDF、切割文件、建立嵌入並存入 FAISS。
+    同時建立 BM25 檢索器。
+    返回一個 EnsembleRetriever (混合搜尋)。
+    """
+    data_dir = Path(DATA_PATH)
+    if not data_dir.exists() or not data_dir.is_dir():
+        print(f"錯誤：資料夾 '{DATA_PATH}' 不存在。")
+        print("請建立 'data' 資料夾並在其中放入 PDF 檔案。")
+        return None
+
+    print(f"正在從 '{DATA_PATH}' 載入 PDF 檔案...")
+    loader = DirectoryLoader(
+        str(data_dir),
+        glob = "**/*.pdf",
+        loader_cls = PyPDFLoader,
+        show_progress = True,
+        use_multithreading = True
     )
+    
+    try:
+        docs = loader.load()
+        if not docs:
+            print(f"在 '{DATA_PATH}' 中找不到 PDF 檔案。")
+            return None
+        print(f"成功載入 {len(docs)} 個文件頁面。")
+    except Exception as e:
+        print(f"載入文件時發生錯誤：{e}")
+        return None
 
-    vectorstore = []
-    if os.path.exists(VECTOR_DB_PATH):
-        try:
-            print(f"正在從 {VECTOR_DB_PATH} 讀取向量數據庫...")
-            vectorstore = FAISS.load_local(VECTOR_DB_PATH, embeddings, allow_dangerous_deserialization = True)
-        except Exception as e:
-            print(f"讀取向量數據庫時出錯: {e}")
+    # 切割文件
+    text_splitter = RecursiveCharacterTextSplitter(
+        chunk_size = 1000,
+        chunk_overlap = 200
+    )
+    splits = text_splitter.split_documents(docs)
+    print(f"文件被切割成 {len(splits)} 個區塊。")
 
-    if not vectorstore:
-        print(f"正在讀取 {DATA_PATH} 下的 **.pdf** 資料...")
-        try:
-            loader = DirectoryLoader(
-                DATA_PATH,
-                glob = "**/*.pdf",
-                loader_cls = PyPDFLoader,
-                show_progress = True,
-                use_multithreading = True,
-            )
-            documents = loader.load()
-        except Exception as e:
-            print(f"讀取文件時出錯: {e}")
-            documents = []
+    # 建立嵌入模型 (for FAISS)
+    print(f"正在初始化嵌入模型：'{EMBED_MODEL_NAME}'...")
+    try:
+        embeddings = HuggingFaceEmbeddings(model_name = EMBED_MODEL_NAME)
+    except Exception as e:
+        print(f"初始化 HuggingFace 嵌入模型失敗：{e}")
+        print("請確保已安裝 'sentence-transformers'。")
+        return None
 
-        if not documents:
-            print("warning: 在指定路徑下未找到任何 .pdf 文件.")
-            splits = []
-        else:
-            print(f"讀取了 {len(documents)} 頁的 pdf 檔案")
-            
-            text_splitter = RecursiveCharacterTextSplitter(
-                chunk_size=1000,
-                chunk_overlap=200,
-                separators=["\n\n", "\n", "。", "！", "？", " ", ""],
-            )
-            splits = text_splitter.split_documents(documents)
-            print(f"資料分割為 {len(splits)} 塊")
+    # --- 建立兩個獨立的檢索器 ---
 
-        if not splits:
-            vectorstore = FAISS.from_texts(["初始化, 沒有資料"], embeddings)
-        else:
-            print("從讀取的文件建立新的 FAISS 索引...")
-            vectorstore = FAISS.from_documents(splits, embeddings)
-            vectorstore.save_local(VECTOR_DB_PATH)
-            print(f"FAISS 索引已創建, path = {VECTOR_DB_PATH}")
+    # 建立 FAISS 向量資料庫 (相似性搜尋)
+    print("正在建立 FAISS 向量資料庫 (for Vector Search)...")
+    try:
+        vectorstore = FAISS.from_documents(splits, embeddings)
+        # 設定 k=3, 讓它檢索 3 份文件
+        faiss_retriever = vectorstore.as_retriever(search_kwargs = {'k' : 3}) 
+    except Exception as e:
+        print(f"建立 FAISS 索引時出錯：{e}")
+        return None
+        
+    # 建立 BM25 檢索器 (關鍵字搜尋)
+    print("正在建立 BM25 檢索器 (for Keyword Search)...")
+    try:
+        # BM25Retriever 需要原始文件區塊 (splits)
+        bm25_retriever = BM25Retriever.from_documents(splits)
+        bm25_retriever.k = 3 # 同樣檢索 3 份
+    except Exception as e:
+        print(f"建立 BM25 索引時出錯：{e}")
+        print("請確保已安裝 'rank-bm25' (pip install rank-bm25)")
+        return None
 
-    return vectorstore.as_retriever(search_kwargs = {"k": 3})
+    # 建立 Ensemble Retriever (混合搜尋)
+    print("正在組合 Ensemble Retriever (混合搜尋)...")
+    ensemble_retriever = EnsembleRetriever(
+        retrievers=[faiss_retriever, bm25_retriever],
+        weights=[0.6, 0.4] # [向量權重, 關鍵字權重]
+    )
+    
+    print("RAG 混合檢索器已準備就緒。")
+    return ensemble_retriever
 
 def create_rag_chain(retriever):
     llm = ChatOllama(model = LLM_MODEL_NAME)

@@ -3,3 +3,5 @@ pypdf
 langchain_community
 langchain_ollama
 faiss-cpu
+rank-bm25
+sentence-transformers
