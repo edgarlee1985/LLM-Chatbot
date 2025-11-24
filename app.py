@@ -298,6 +298,7 @@ def main():
 
             # 執行鏈
             frist_answer = True
+            seen_sources = set()
             for chunk in chain_with_history.stream({"question": user_input}, config = config):
                 if answer_chunk := chunk.get("answer"):
                     if frist_answer:
