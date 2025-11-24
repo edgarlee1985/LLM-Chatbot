@@ -213,20 +213,14 @@ def create_rag_chain(llm, retriever):
 
     return final_rag_chain
 
-def print_retrieval_docs(result):
-    source_docs = result['sources']
-    # 顯示來源
-    if source_docs:
-        print("\n--- 檢索來源 ---")
-        seen_sources = set()
-        for doc in source_docs:
-            source_file = doc.metadata.get('source', '未知檔案')
-            page = doc.metadata.get('page', 'N/A')
-            source_key = f"{os.path.basename(source_file)} (頁碼: {page + 1})"
-            
-            if source_key not in seen_sources:
-                print(f"  - {source_key}")
-                seen_sources.add(source_key)
+def collect_retrieval_docs(sources_chunk) -> set:
+    seen_sources = set()
+    for doc in sources_chunk:
+        source_file = doc.metadata.get('source', '未知檔案')
+        page = doc.metadata.get('page', 'N/A')
+        source_key = f"{os.path.basename(source_file)} (頁碼: {page + 1})"
+        seen_sources.add(source_key)
+    return seen_sources
 
 def summit_feed_score(current_trace_id: str):
     # Langfuse 評分回饋機制
@@ -297,19 +291,25 @@ def main():
         print("機器人思考中...")
         try:
             config = {"callbacks": [langfuse_callback]}
-            # 4.5. 呼叫 (invoke) 鏈
+            # 呼叫 (invoke) 鏈
             # 需要傳遞 'question' (符合 input_messages_key)
             # 需要在 config 中傳遞 'session_id'
             config = {"configurable": {"session_id": session_id}, "callbacks": [langfuse_callback]}
 
             # 執行鏈
-            result = chain_with_history.invoke(
-                {"question": user_input},
-                config = config)
-            print("\nAnswer:\n" + result['answer'])
+            frist_answer = True
+            for chunk in chain_with_history.stream({"question": user_input}, config = config):
+                if answer_chunk := chunk.get("answer"):
+                    if frist_answer:
+                        print("Answer:")
+                        frist_answer = False
+                    print(f"{answer_chunk}", end = "", flush = True)
+                if sources_chunk := chunk.get("sources"):
+                    seen_sources = collect_retrieval_docs(sources_chunk)
 
-            print_retrieval_docs(result)
-
+            print("\n--- 檢索來源 ---")
+            for source_key in seen_sources:
+                print(f"  - {source_key}")
             print("-" * 60)
             end_time = time.perf_counter()
             execution_time = end_time - start_time
